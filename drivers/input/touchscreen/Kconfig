@@ -11,6 +11,9 @@ menuconfig INPUT_TOUCHSCREEN
 
 if INPUT_TOUCHSCREEN
 
+source "drivers/input/touchscreen/focaltech_mmi/Kconfig"
+source "drivers/input/touchscreen/focaltech_0flash_mmi/Kconfig"
+
 config TOUCHSCREEN_PROPERTIES
 	def_tristate INPUT
 	depends on INPUT
@@ -1297,6 +1300,18 @@ config TOUCHSCREEN_SYNAPTICS_TCM
 	  Say Y here if you have a Synaptics Touchscreen.
 
 	  If unsure, say N.
+
+config TOUCHSCREEN_FOCALTECH_MMI
+	tristate "Focaltech Touchscreen Driver"
+	depends on I2C
+
+config INPUT_FOCALTECH_0FLASH_MMI_IC_NAME
+	string "Focaltech IC Name"
+	depends on I2C
+
+config INPUT_FOCALTECH_0FLASH_MMI_IC_NAME_FT8756
+	bool "Focaltech Touchscreen Driver"
+	depends on I2C
 
 source "drivers/input/touchscreen/synaptics_tcm/Kconfig"
 
