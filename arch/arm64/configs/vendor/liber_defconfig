@@ -1567,6 +1567,9 @@ CONFIG_QPNP_MISC=y
 # CONFIG_CXL_BASE is not set
 # CONFIG_CXL_AFU_DRIVER_OPS is not set
 # CONFIG_CXL_LIB is not set
+CONFIG_INPUT_FINGERPRINT=y
+CONFIG_FINGERPRINT_GOODIX_FOD_MMI=y
+
 
 #
 # FingerprintCard fingerprint driver
