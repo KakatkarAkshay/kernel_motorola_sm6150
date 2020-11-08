@@ -55,6 +55,7 @@
 #define FTS_DRIVER_NAME                     "fts_ts"
 #define INTERVAL_READ_REG                   200  /* unit:ms */
 #define TIMEOUT_READ_REG                    1000 /* unit:ms */
+#define FTS_PALM_SENSOR 2
 #if FTS_USB_DETECT_EN
 bool 	FTS_USB_detect_flag;
 #endif
@@ -69,6 +70,26 @@ bool 	FTS_USB_detect_flag;
 * Global variable or extern global variabls/functions
 *****************************************************************************/
 struct fts_ts_data *fts_data;
+
+#ifdef FOCALTECH_PALM_SENSOR_EN
+static struct sensors_classdev __maybe_unused palm_sensors_touch_cdev = {
+    .name = "palm-gesture",
+    .vendor = "Focaltech",
+    .version = 1,
+    .type = SENSOR_TYPE_MOTO_TOUCH_PALM,
+    .max_range = "5.0",
+    .resolution = "5.0",
+    .sensor_power = "1",
+    .min_delay = 0,
+    .max_delay = 0,
+    .fifo_reserved_event_count = 0,
+    .fifo_max_event_count = 0,
+    .enabled = 0,
+    .delay_msec = 200,
+    .sensors_enable = NULL,
+    .sensors_poll_delay = NULL,
+};
+#endif
 
 /*****************************************************************************
 * Static function prototypes
@@ -94,7 +115,7 @@ int fts_wait_tp_to_valid(void)
     do {
         ret = fts_read_reg(FTS_REG_CHIP_ID, &reg_value);
         if ((ret < 0) || (reg_value != chip_id)) {
-            FTS_DEBUG("TP Not Ready, ReadData = 0x%x", reg_value);
+            FTS_INFO("TP Not Ready, ReadData = 0x%x", reg_value);
         } else if (reg_value == chip_id) {
             FTS_INFO("TP Ready, Device ID = 0x%x", reg_value);
             return 0;
@@ -123,6 +144,12 @@ void fts_tp_state_recovery(struct fts_ts_data *ts_data)
     /* recover TP cover state 0xC1 */
     fts_ex_mode_recovery(ts_data);
     /* recover TP gesture state 0xD0 */
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    if (ts_data->palm_detection_enabled) {
+        fts_write_reg(0xB0, 0x01);
+        FTS_INFO("Resume palm detect mode.");
+    }
+#endif
 #if FTS_GESTURE_EN
     fts_gesture_recovery(ts_data);
 #endif
@@ -603,6 +630,37 @@ static int fts_read_touchdata(struct fts_ts_data *data)
     return 0;
 }
 
+#ifdef FOCALTECH_PALM_SENSOR_EN
+static void fts_palm_report(bool active) {
+    if (active) {
+        input_report_abs(fts_data->palm_sensor_pdata->input_sensor_dev,
+                         ABS_DISTANCE, 1);
+        input_sync(fts_data->palm_sensor_pdata->input_sensor_dev);
+        FTS_INFO("%s: palm report 1\n", __func__);
+    } else {
+        input_report_abs(fts_data->palm_sensor_pdata->input_sensor_dev,
+                         ABS_DISTANCE, 0);
+        input_sync(fts_data->palm_sensor_pdata->input_sensor_dev);
+        FTS_INFO("%s: palm report 0\n", __func__);
+    }
+}
+
+static int fts_palm_detect(u8 reg_data) {
+    int fd_val = reg_data & 0x03;
+
+    FTS_DEBUG("%s: 0x01=0x%0X!, fd_val=%d\n", __func__, reg_data, fd_val);
+    if (fd_val == 1) {
+        FTS_INFO("%s: palm detect!\n", __func__);
+        return 1;
+    }
+    if (fd_val == 2) {
+        FTS_INFO("%s: palm leave!\n", __func__);
+        return 2;
+    }
+    return 0;
+}
+#endif
+
 static int fts_read_parse_touchdata(struct fts_ts_data *data)
 {
     int ret = 0;
@@ -612,11 +670,42 @@ static int fts_read_parse_touchdata(struct fts_ts_data *data)
     struct ts_event *events = data->events;
     int max_touch_num = data->pdata->max_touch_number;
     u8 *buf = data->point_buf;
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    int pd_state = 0;
+#endif
 
     ret = fts_read_touchdata(data);
     if (ret) {
         return ret;
     }
+
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    if (data->palm_detection_enabled) {
+        pd_state = fts_palm_detect(buf[1]);
+        if (pd_state > 0) {
+            if (pd_state == 1) {
+                del_timer(&fts_data->palm_release_fimer);
+                fts_palm_report(true);
+                return -1;
+	    } else if (pd_state == 2) {
+                mod_timer(&fts_data->palm_release_fimer,
+                          jiffies + msecs_to_jiffies(fts_data->palm_release_delay_ms));
+#ifdef CONFIG_HAS_WAKELOCK
+                wake_lock_timeout(&fts_data->palm_gesture_wakelock,
+                                  fts_data->palm_release_delay_ms);
+#else
+                __pm_wakeup_event(&fts_data->palm_gesture_wakelock,
+                                  fts_data->palm_release_delay_ms);
+#endif
+                return -1;
+            }
+        }
+        if (buf[1] & 0x08) {
+            FTS_ERROR("Invalid palm detect value. 0x%0X", buf[1]);
+            return -1;
+        }
+    }
+#endif
 
     data->point_num = buf[FTS_TOUCH_POINT_NUM] & 0x0F;
     data->touch_point = 0;
@@ -737,7 +826,7 @@ static void fts_irq_read_report(void)
 #endif
 
     ret = fts_read_parse_touchdata(ts_data);
-    if (ret == 0) {
+    if ((ret == 0) && !ts_data->suspended) {
         mutex_lock(&ts_data->report_mutex);
 #if FTS_MT_PROTOCOL_B_EN
         fts_input_report_b(ts_data);
@@ -859,6 +948,165 @@ static int fts_report_buffer_init(struct fts_ts_data *ts_data)
 
     return 0;
 }
+
+
+#ifdef FOCALTECH_PALM_SENSOR_EN
+static void fts_palm_sensor_release_timer_handler(unsigned long data)
+{
+    fts_palm_report(false);
+}
+
+static int _fts_palm_sensor_set_enable(unsigned int enable)
+{
+    FTS_INFO("Palm gesture set enable %d!", enable);
+/*
+ * If palm detect function is enabled, interrupt will not disable, IC works in
+ * normal mode. But in case touch event is reported to input subsystem, skip
+ * touch event when suspend flag is true. So input subsystem will not take
+ * wakelock because no one report event.
+ * In this case, we still need read data from IC, so AP can not enter suspend.
+ */
+    if (enable == 1) {
+#ifdef CONFIG_HAS_WAKELOCK
+        wake_lock(&fts_data->palm_gesture_read_wakelock);
+#else
+        __pm_stay_awake(&fts_data->palm_gesture_read_wakelock);
+#endif
+        fts_data->palm_detection_enabled = true;
+        fts_write_reg(0xB0, 0x01);
+    } else if (enable == 0) {
+        fts_data->palm_detection_enabled = false;
+        if (timer_pending(&fts_data->palm_release_fimer)) {
+            fts_palm_report(false);
+            del_timer(&fts_data->palm_release_fimer);
+        }
+        fts_write_reg(0xB0, 0x00);
+#ifdef CONFIG_HAS_WAKELOCK
+        wake_unlock(&fts_data->palm_gesture_read_wakelock);
+#else
+        __pm_relax(&fts_data->palm_gesture_read_wakelock);
+#endif
+    } else {
+        FTS_INFO("unknown enable symbol\n");
+    }
+    return 0;
+}
+
+static int fts_palm_sensor_set_enable(struct sensors_classdev *sensors_cdev,
+		unsigned int enable)
+{
+    int ret = 0;
+
+    mutex_lock(&fts_data->suspend_resume_mutex);
+    if (!fts_data->suspended)
+        ret = _fts_palm_sensor_set_enable(enable);
+    else {
+        FTS_INFO("Gesture lazy set enable %d!", enable);
+        if (enable == 1)
+            fts_data->palm_detection_lazy_set = PALM_SENSOR_LAZY_SET_ENABLE;
+        else if (enable == 0)
+            fts_data->palm_detection_lazy_set = PALM_SENSOR_LAZY_SET_DISABLE;
+        else
+            FTS_INFO("unknown enable symbol\n");
+    }
+    mutex_unlock(&fts_data->suspend_resume_mutex);
+    fts_palm_report(false);
+
+    return ret;
+}
+
+static int fts_palm_sensor_init(struct fts_ts_data *data)
+{
+    struct focaltech_sensor_platform_data *sensor_pdata;
+    struct input_dev *sensor_input_dev;
+    int err;
+
+    sensor_input_dev = input_allocate_device();
+    if (!sensor_input_dev) {
+        FTS_ERROR("Failed to allocate device");
+        goto exit;
+    }
+
+    sensor_pdata = devm_kzalloc(&sensor_input_dev->dev,
+                                sizeof(struct focaltech_sensor_platform_data),
+                                GFP_KERNEL);
+    if (!sensor_pdata) {
+        FTS_ERROR("Failed to allocate memory");
+        goto free_sensor_pdata;
+    }
+    data->palm_sensor_pdata = sensor_pdata;
+
+    __set_bit(EV_ABS, sensor_input_dev->evbit);
+    __set_bit(EV_SYN, sensor_input_dev->evbit);
+    input_set_abs_params(sensor_input_dev, ABS_DISTANCE,
+                         0, 5, 0, 0);
+    sensor_input_dev->name = "palm_detect";
+    data->palm_sensor_pdata->input_sensor_dev = sensor_input_dev;
+
+    err = input_register_device(sensor_input_dev);
+    if (err) {
+        FTS_ERROR("Unable to register device, err=%d", err);
+        goto free_sensor_input_dev;
+    }
+
+    sensor_pdata->ps_cdev = palm_sensors_touch_cdev;
+    sensor_pdata->ps_cdev.sensors_enable = fts_palm_sensor_set_enable;
+    sensor_pdata->data = data;
+
+    err = sensors_classdev_register(&sensor_input_dev->dev,
+                                    &sensor_pdata->ps_cdev);
+    if (err)
+        goto unregister_sensor_input_device;
+
+#ifdef CONFIG_HAS_WAKELOCK
+    wake_lock_init(&data->palm_gesture_wakelock, WAKE_LOCK_SUSPEND, "palm_detect_wl");
+#else
+    wakeup_source_init(&data->palm_gesture_wakelock, "palm_detect_wl");
+#endif
+#ifdef CONFIG_HAS_WAKELOCK
+    wake_lock_init(&data->palm_gesture_read_wakelock, WAKE_LOCK_SUSPEND, "palm_read_wl");
+#else
+    wakeup_source_init(&data->palm_gesture_read_wakelock, "palm_read_wl");
+#endif
+
+    data->palm_release_fimer.function = fts_palm_sensor_release_timer_handler;
+    init_timer(&data->palm_release_fimer);
+    data->palm_release_delay_ms = 850;
+
+    return 0;
+
+unregister_sensor_input_device:
+    input_unregister_device(data->palm_sensor_pdata->input_sensor_dev);
+free_sensor_input_dev:
+    input_free_device(data->palm_sensor_pdata->input_sensor_dev);
+free_sensor_pdata:
+    devm_kfree(&sensor_input_dev->dev, sensor_pdata);
+    data->palm_sensor_pdata = NULL;
+exit:
+    return 1;
+}
+
+int fts_palm_sensor_remove(struct fts_ts_data *data)
+{
+    sensors_classdev_unregister(&data->palm_sensor_pdata->ps_cdev);
+    input_unregister_device(data->palm_sensor_pdata->input_sensor_dev);
+    devm_kfree(&data->palm_sensor_pdata->input_sensor_dev->dev,
+               data->palm_sensor_pdata);
+#ifdef CONFIG_HAS_WAKELOCK
+    wake_lock_destroy(&data->palm_gesture_wakelock);
+#else
+    wakeup_source_trash(&data->palm_gesture_wakelock);
+#endif
+#ifdef CONFIG_HAS_WAKELOCK
+    wake_lock_destroy(&data->palm_gesture_read_wakelock);
+#else
+    wakeup_source_trash(&data->palm_gesture_read_wakelock);
+#endif
+    data->palm_sensor_pdata = NULL;
+    data->palm_detection_enabled = false;
+    return 0;
+}
+#endif
 
 #if FTS_POWER_SOURCE_CUST_EN
 /*****************************************************************************
@@ -1277,6 +1525,14 @@ static int fts_parse_dt(struct device *dev, struct fts_ts_platform_data *pdata)
     if (pdata->always_on_vio)
         FTS_INFO("TP VIO always on.");
 
+    pdata->report_gesture_key = of_property_read_bool(np, "focaltech,report_gesture_key");
+    if (pdata->report_gesture_key)
+        FTS_INFO("Report tap gesture as key.");
+
+    pdata->dlfw_in_resume = of_property_read_bool(np, "focaltech,dlfw_in_resume");
+    if (pdata->dlfw_in_resume)
+        FTS_INFO("Reset touch when firmware abnormal in resume.");
+
     pdata->irq_gpio = of_get_named_gpio_flags(np, "focaltech,irq-gpio",
                       0, &pdata->irq_gpio_flags);
     if (pdata->irq_gpio < 0)
@@ -1352,6 +1608,12 @@ int drm_notifier_callback(struct notifier_block *self,
         if (MSM_DRM_EARLY_EVENT_BLANK == event) {
             cancel_work_sync(&fts_data->resume_work);
             fts_ts_suspend(ts_data->dev);
+#ifdef FOCALTECH_PALM_SENSOR_EN
+            if (ts_data->palm_detection_enabled) {
+                FTS_INFO("palm detection is enabled");
+                return FTS_PALM_SENSOR;
+            }
+#endif
 #ifdef FOCALTECH_SENSOR_EN
             if (fts_data->should_enable_gesture) {
                 FTS_INFO("double tap gesture suspend\n");
@@ -1455,6 +1717,53 @@ static int fts_charger_notifier_callback(struct notifier_block *nb,
 }
 #endif
 
+static int fts_reboot(struct notifier_block *nb,
+			unsigned long event,
+			void *unused)
+{
+	struct fts_ts_data *ts_data = container_of(nb, struct fts_ts_data, fts_reboot);
+
+	FTS_FUNC_ENTER();
+
+#if FTS_ESDCHECK_EN
+	fts_esdcheck_suspend();
+#endif
+
+#if FTS_USB_DETECT_EN
+	if (ts_data->charger_notif.notifier_call)
+		power_supply_unreg_notifier(&ts_data->charger_notif);
+#endif
+
+#ifdef CONFIG_DRM
+	if (msm_drm_unregister_client(&ts_data->fb_notif))
+		FTS_ERROR("Error occurred while unregistering fb_notifier.\n");
+#elif defined(CONFIG_FB)
+	if (fb_unregister_client(&ts_data->fb_notif))
+		FTS_ERROR("Error occurred while unregistering fb_notifier.\n");
+#elif defined(CONFIG_HAS_EARLYSUSPEND)
+	unregister_early_suspend(&ts_data->early_suspend);
+#endif
+
+	fts_irq_disable();
+	free_irq(ts_data->irq, ts_data);
+
+	if (gpio_is_valid(ts_data->pdata->reset_gpio)) {
+		gpio_direction_output(ts_data->pdata->reset_gpio, 0);
+		msleep(20);
+		gpio_free(ts_data->pdata->reset_gpio);
+	}
+	if (gpio_is_valid(ts_data->pdata->irq_gpio))
+		gpio_free(ts_data->pdata->irq_gpio);
+
+#if FTS_POWER_SOURCE_CUST_EN
+	fts_power_source_exit(ts_data);
+#endif
+
+	FTS_FUNC_EXIT();
+
+	return NOTIFY_DONE;
+}
+
 static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
 {
     int ret = 0;
@@ -1489,6 +1798,7 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
     spin_lock_init(&ts_data->irq_lock);
     mutex_init(&ts_data->report_mutex);
     mutex_init(&ts_data->bus_lock);
+    mutex_init(&ts_data->suspend_resume_mutex);
 #ifdef FOCALTECH_SENSOR_EN
     mutex_init(&ts_data->state_mutex);
     //unknown screen state
@@ -1571,6 +1881,13 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
     }
 #endif
 
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    ret = fts_palm_sensor_init(ts_data);
+    if (ret) {
+        FTS_ERROR("init palm detect sensor fail");
+    }
+#endif
+
 #if FTS_TEST_EN
     ret = fts_test_init(ts_data);
     if (ret) {
@@ -1631,9 +1948,19 @@ static int fts_ts_probe_entry(struct fts_ts_data *ts_data)
 	}
 #endif
 
+	ts_data->fts_reboot.notifier_call = fts_reboot;
+	ts_data->fts_reboot.next = NULL;
+	ts_data->fts_reboot.priority = 1;
+	ret = register_reboot_notifier(&ts_data->fts_reboot);
+	if (ret) {
+		FTS_ERROR("register for reboot failed\n");
+		goto reboot_register_err;
+	}
+
     FTS_FUNC_EXIT();
     return 0;
 
+reboot_register_err:
 #if FTS_USB_DETECT_EN
 err_register_charger_notify_failed:
 if (ts_data->charger_notif.notifier_call)
@@ -1670,6 +1997,8 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
 {
     FTS_FUNC_ENTER();
 
+	unregister_reboot_notifier(&ts_data->fts_reboot);
+
 #if FTS_USB_DETECT_EN
 	if (ts_data->charger_notif.notifier_call)
 		power_supply_unreg_notifier(&ts_data->charger_notif);
@@ -1697,6 +2026,10 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
 
 #if FTS_ESDCHECK_EN
     fts_esdcheck_exit(ts_data);
+#endif
+
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    fts_palm_sensor_remove(ts_data);
 #endif
 
 #if FTS_GESTURE_EN
@@ -1742,7 +2075,7 @@ static int fts_ts_remove_entry(struct fts_ts_data *ts_data)
     return 0;
 }
 
-static int fts_ts_suspend(struct device *dev)
+static int _fts_ts_suspend(struct device *dev)
 {
     int ret = 0;
     struct fts_ts_data *ts_data = fts_data;
@@ -1770,6 +2103,22 @@ static int fts_ts_suspend(struct device *dev)
 
 #if FTS_ESDCHECK_EN
     fts_esdcheck_suspend();
+#endif
+
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    if (ts_data->palm_detection_enabled) {
+        ret = enable_irq_wake(ts_data->irq);
+        if (ret) {
+            FTS_DEBUG("enable_irq_wake(irq:%d) fail", ts_data->irq);
+        }
+        fts_release_all_finger();
+        ts_data->suspended = true;
+#ifdef FOCALTECH_SENSOR_EN
+        mutex_unlock(&ts_data->state_mutex);
+#endif
+        FTS_INFO("Enter from palm detect suspend mode.");
+        return 0;
+    }
 #endif
 
 #if FTS_GESTURE_EN
@@ -1825,8 +2174,19 @@ static int fts_ts_suspend(struct device *dev)
     return 0;
 }
 
-static int fts_ts_resume(struct device *dev)
+static int fts_ts_suspend(struct device *dev)
 {
+    int ret = 0;
+    mutex_lock(&fts_data->suspend_resume_mutex);
+    ret = _fts_ts_suspend(dev);
+    mutex_unlock(&fts_data->suspend_resume_mutex);
+
+    return ret;
+}
+
+static int _fts_ts_resume(struct device *dev)
+{
+    int ret = 0;
     struct fts_ts_data *ts_data = fts_data;
 
 #ifdef FOCALTECH_SENSOR_EN
@@ -1857,10 +2217,35 @@ static int fts_ts_resume(struct device *dev)
     }
 
     fts_irq_enable();
+
+    if (ts_data->pdata->dlfw_in_resume) {
+        ret = fts_wait_tp_to_valid();
+        if(ret){
+            FTS_INFO("wait tp to valid abnormal,need download fw");
+            fts_fw_resume(true);
+            msleep(10);
+        }
+    }
     fts_tp_state_recovery(ts_data);
 
 #if FTS_ESDCHECK_EN
     fts_esdcheck_resume();
+#endif
+
+#ifdef FOCALTECH_PALM_SENSOR_EN
+    if (ts_data->palm_detection_enabled) {
+        int ret = 0;
+        ret = disable_irq_wake(ts_data->irq);
+        if (ret) {
+            FTS_DEBUG("disable_irq_wake(irq:%d) fail", ts_data->irq);
+        }
+        ts_data->suspended = false;
+#ifdef FOCALTECH_SENSOR_EN
+        mutex_unlock(&ts_data->state_mutex);
+#endif
+        FTS_INFO("Exit from palm detect suspend mode.");
+        goto CHECK_LAZY_SET;
+    }
 #endif
 
 #if FTS_GESTURE_EN
@@ -1894,7 +2279,26 @@ static int fts_ts_resume(struct device *dev)
     mutex_unlock(&ts_data->state_mutex);
     ts_data->screen_state = SCREEN_ON;
 #endif
+#ifdef FOCALTECH_PALM_SENSOR_EN
+CHECK_LAZY_SET:
+    if (ts_data->palm_detection_lazy_set != PALM_SENSOR_LAZY_SET_NONE) {
+        _fts_palm_sensor_set_enable(
+            (ts_data->palm_detection_lazy_set == PALM_SENSOR_LAZY_SET_ENABLE) ? 1 : 0);
+        FTS_INFO("Palm sensor lazy set done, clear flag.");
+        ts_data->palm_detection_lazy_set = PALM_SENSOR_LAZY_SET_NONE;
+    }
+#endif
     return 0;
+}
+
+static int fts_ts_resume(struct device *dev)
+{
+    int ret = 0;
+    mutex_lock(&fts_data->suspend_resume_mutex);
+    ret = _fts_ts_resume(dev);
+    mutex_unlock(&fts_data->suspend_resume_mutex);
+
+    return ret;
 }
 
 /*****************************************************************************
