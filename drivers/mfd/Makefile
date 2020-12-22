@@ -62,6 +62,12 @@ endif
 ifeq ($(CONFIG_MFD_CS47L24),y)
 obj-$(CONFIG_MFD_ARIZONA)	+= cs47l24-tables.o
 endif
+cirrus_madera-core-y	:= madera-core.o
+cirrus_madera-core-$(CONFIG_MFD_CS47L35)	+= cs47l35-tables.o
+cirrus_madera-core-$(CONFIG_MFD_CS47L90)	+= cs47l90-tables.o
+cirrus_madera-core-$(CONFIG_MFD_MADERA_I2C)	+= madera-i2c.o
+cirrus_madera-core-$(CONFIG_MFD_MADERA_SPI)	+= madera-spi.o
+obj-$(CONFIG_MFD_MADERA) += cirrus_madera-core.o
 obj-$(CONFIG_MFD_WM8400)	+= wm8400-core.o
 wm831x-objs			:= wm831x-core.o wm831x-irq.o wm831x-otp.o
 wm831x-objs			+= wm831x-auxadc.o
